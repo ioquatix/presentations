@@ -1,0 +1,185 @@
+
+require 'sequel'
+require 'fileutils'
+
+require 'async'
+
+require 'async/http/internet'
+require 'async/semaphore'
+require 'async/barrier'
+
+require 'async/io/notification'
+
+task :environment do
+	DB = Sequel.connect("postgres://localhost/rubygems")
+	
+	@cache_root = File.expand_path("cache", __dir__)
+	@pattern = File.expand_path("*/*", @cache_root)
+	@limit = 100_000
+	
+	@gems = DB.from(:gem_downloads).select_group(:name, :rubygem_id).select_more{sum(:count).as(:total)}.join(:rubygems, id: :rubygem_id).reverse_order(:total).limit(@limit)
+end
+
+def defer(*args, parent: Async::Task.current, &block)
+	parent.async do
+		notification = Async::IO::Notification.new
+		
+		thread = Thread.new(*args) do
+			yield
+		ensure
+			notification.signal
+		end
+		
+		notification.wait
+		thread.join
+	ensure
+		notification.close
+	end
+end
+
+task :count => :environment do
+	installed_gems = Dir.glob(@pattern).map{|path| File.basename(path).rpartition('-').values_at(0, 2)}.to_h
+	
+	puts "#{installed_gems.size} installed gems."
+	
+	viable = 0
+	
+	Dir.glob(@pattern) do |path|
+		lib_path = File.expand_path("lib", path)
+		unless File.directory?(lib_path)
+			puts "#{path} does not have `lib` directory!"
+		end
+		
+		viable += 1
+	end
+	
+	puts "Found #{viable} viable lib paths..."
+end
+
+task :statistics => :environment do
+	total = DB.from(:gem_downloads).sum(:count)
+	top_total = @gems.sum(:total)
+	
+	puts "Top #{@limit} gems represents #{(@limit.to_f / DB.from(:rubygems).count * 100.0).to_f.round(2)}%"
+	puts "Downloads of top #{@limit} gems: #{(top_total / total * 100.0).to_f.round(2)}%"
+	
+	width = 100
+	
+	File.open("downloads.csv", "w") do |file|
+		totals = @gems.map{|gem| gem[:total]}
+		
+		bins = totals.each_slice(width).map{|slice| slice.sum / slice.size}
+		
+		bins.each{|value| file.puts value.to_i}
+	end
+end
+
+task :list => :environment do
+	installed_gems = Dir.glob(@pattern).map{|path| [File.basename(path).rpartition('-').first, path]}.to_h
+	
+	@gems.limit(100).each do |gem|
+		puts "Gem: #{gem[:name]} has #{gem[:total].to_i} downloads."
+		
+		sum = Hash.new{|h,k| h[k] = 0}
+		
+		root = installed_gems[gem[:name]]
+		source_files = File.expand_path("lib/**/*.rb", root)
+		
+		Dir.glob(source_files) do |path|
+			begin
+				code = File.read(path)
+				
+				code.scan(/Thread|Mutex|\.synchronize/) do |match|
+					sum[match.to_s] += 1
+				end
+			rescue
+				Async.logger.error(path, $!)
+			end
+		end
+		
+		unless sum.empty?
+			puts "\t#{root} #{sum}"
+		end
+	end
+end
+
+task :fetch => :environment do
+	installed_gems = Dir.glob(@pattern).map{|path| [File.basename(path).rpartition('-').first, path]}.to_h
+	
+	puts "#{installed_gems.size} installed gems."
+	
+	puts "Considering #{gems.count} gems..."
+	
+	skipped = 0
+	
+	Async do
+		semaphore = Async::Semaphore.new(10)
+		barrier = Async::Barrier.new(parent: semaphore)
+		
+		@gems.each do |gem|
+			if path = installed_gems[gem[:name]]
+				skipped += 1
+				
+				lib_path = File.join(path, "lib")
+				
+				unless File.directory?(lib_path)
+					puts "#{gem[:name]} doesn't have lib path... (#{gem})"
+				end
+				
+				next
+			end
+			
+			cache_path = File.expand_path(gem[:name][0...3], @cache_root)
+			FileUtils.mkdir_p cache_path
+			
+			Async.logger.info "Fetching #{gem[:name]} which has #{gem[:total].to_i} downloads..."
+			
+			defer(parent: barrier) do
+				sh("gem", "unpack", gem[:name], chdir: cache_path)
+			end
+		end
+		
+		barrier.wait
+	end
+	
+	puts "Skipped #{skipped} gems."
+end
+
+task :check => :environment do
+	puts "Found #{Dir.glob(@pattern).size} gem directories"
+	
+	count = {
+		gems: 0,
+		files: 0
+	}
+	
+	sums = {}
+	
+	Dir.glob(@pattern) do |root|
+		count[:gems] += 1
+		sum = Hash.new{|h,k| h[k] = 0}
+		
+		source_files = File.expand_path("**/*.rb", root)
+		
+		Dir.glob(source_files) do |path|
+			begin
+				code = File.read(path)
+				
+				code.scan(/Thread|Mutex|\.synchronize/) do |match|
+					sum[match.to_s] += 1
+				end
+				
+				count[:files] += 1
+			rescue
+				Async.logger.error(path, $!)
+			end
+		end
+		
+		unless sum.empty?
+			puts "#{root} #{sum}"
+			sums[root] = sum
+		end
+	end
+	
+	puts "Out of #{count[:gems]}, #{(sums.size.to_f / count[:gems] * 100.0).to_f.round(2)}% use Thread constructs explicitly."
+end
