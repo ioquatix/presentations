@@ -10,34 +10,19 @@ require 'async/barrier'
 
 require 'async/io/notification'
 
-task :environment do
-	DB = Sequel.connect("postgres://localhost/rubygems")
+def initialize(context)
+	super
+	
+	@database = Sequel.connect("postgres://localhost/rubygems")
 	
 	@cache_root = File.expand_path("cache", __dir__)
 	@pattern = File.expand_path("*/*", @cache_root)
-	@limit = 100_000
+	@limit = 10_000
 	
-	@gems = DB.from(:gem_downloads).select_group(:name, :rubygem_id).select_more{sum(:count).as(:total)}.join(:rubygems, id: :rubygem_id).reverse_order(:total).limit(@limit)
+	@gems = @database.from(:gem_downloads).select_group(:name, :rubygem_id).select_more{sum(:count).as(:total)}.join(:rubygems, id: :rubygem_id).reverse_order(:total).limit(@limit)
 end
 
-def defer(*args, parent: Async::Task.current, &block)
-	parent.async do
-		notification = Async::IO::Notification.new
-		
-		thread = Thread.new(*args) do
-			yield
-		ensure
-			notification.signal
-		end
-		
-		notification.wait
-		thread.join
-	ensure
-		notification.close
-	end
-end
-
-task :count => :environment do
+def count
 	installed_gems = Dir.glob(@pattern).map{|path| File.basename(path).rpartition('-').values_at(0, 2)}.to_h
 	
 	puts "#{installed_gems.size} installed gems."
@@ -56,30 +41,33 @@ task :count => :environment do
 	puts "Found #{viable} viable lib paths..."
 end
 
-task :statistics => :environment do
-	total = DB.from(:gem_downloads).sum(:count)
+def statistics
+	top_downloads = @database.from(:gem_downloads).sum(:count)
 	top_total = @gems.sum(:total)
+	total = @database.from(:rubygems).count
 	
-	puts "Top #{@limit} gems represents #{(@limit.to_f / DB.from(:rubygems).count * 100.0).to_f.round(2)}%"
-	puts "Downloads of top #{@limit} gems: #{(top_total / total * 100.0).to_f.round(2)}%"
+	puts "There are #{total} gems in the database."
 	
-	width = 100
+	puts "Top #{@limit} gems represents #{(@limit.to_f / total * 100.0).to_f.round(2)}% of all gems."
+	puts "Top #{@limit} gems accounts for #{(top_total / top_downloads * 100.0).to_f.round(2)}% of all downloads."
+	
+	width = 10
 	
 	File.open("downloads.csv", "w") do |file|
 		totals = @gems.map{|gem| gem[:total]}
 		
-		bins = totals.each_slice(width).map{|slice| slice.sum / slice.size}
+		bins = totals.each_slice(width).map{|slice| slice.sum.to_i}
 		
-		bins.each{|value| file.puts value.to_i}
+		bins.each{|value| file.puts value}
 	end
+	
+	system("gnuplot downloads.gnuplot > downloads.svg")
 end
 
-task :list => :environment do
+def list
 	installed_gems = Dir.glob(@pattern).map{|path| [File.basename(path).rpartition('-').first, path]}.to_h
 	
-	@gems.limit(100).each do |gem|
-		puts "Gem: #{gem[:name]} has #{gem[:total].to_i} downloads."
-		
+	@gems.limit(1000).each do |gem|
 		sum = Hash.new{|h,k| h[k] = 0}
 		
 		root = installed_gems[gem[:name]]
@@ -89,7 +77,8 @@ task :list => :environment do
 			begin
 				code = File.read(path)
 				
-				code.scan(/Thread|Mutex|\.synchronize/) do |match|
+				# code.scan(/Thread|Mutex|\.synchronize/) do |match|
+				code.scan(/\|\|= Mutex/) do |match|
 					sum[match.to_s] += 1
 				end
 			rescue
@@ -98,12 +87,13 @@ task :list => :environment do
 		end
 		
 		unless sum.empty?
+			puts "Gem: #{gem[:name]} has #{gem[:total].to_i} downloads."
 			puts "\t#{root} #{sum}"
 		end
 	end
 end
 
-task :fetch => :environment do
+def fetch
 	installed_gems = Dir.glob(@pattern).map{|path| [File.basename(path).rpartition('-').first, path]}.to_h
 	
 	puts "#{installed_gems.size} installed gems."
@@ -145,8 +135,10 @@ task :fetch => :environment do
 	puts "Skipped #{skipped} gems."
 end
 
-task :check => :environment do
-	puts "Found #{Dir.glob(@pattern).size} gem directories"
+def check
+	installed_gems = Dir.glob(@pattern).map{|path| [File.basename(path).rpartition('-').first, path]}.to_h
+	
+	puts "Found #{installed_gems.size} gem directories"
 	
 	count = {
 		gems: 0,
@@ -155,7 +147,10 @@ task :check => :environment do
 	
 	sums = {}
 	
-	Dir.glob(@pattern) do |root|
+	@gems.each do |gem|
+		puts "Considering #{gem[:name]} #{gem[:total].to_i} downloads..."
+		root = installed_gems[gem[:name]]
+		
 		count[:gems] += 1
 		sum = Hash.new{|h,k| h[k] = 0}
 		
@@ -164,11 +159,14 @@ task :check => :environment do
 		Dir.glob(source_files) do |path|
 			begin
 				code = File.read(path)
+				found = Hash.new{|h,k| h[k] = 0}
 				
-				code.scan(/Thread|Mutex|\.synchronize/) do |match|
+				code.scan(/Mutex|Monitor/) do |match|
 					sum[match.to_s] += 1
+					found[match.to_s] += 1
 				end
 				
+				puts "\t#{path} #{found}" unless found.empty?
 				count[:files] += 1
 			rescue
 				Async.logger.error(path, $!)
@@ -176,10 +174,29 @@ task :check => :environment do
 		end
 		
 		unless sum.empty?
-			puts "#{root} #{sum}"
+			puts "\t ** #{root} #{sum}"
 			sums[root] = sum
 		end
 	end
 	
 	puts "Out of #{count[:gems]}, #{(sums.size.to_f / count[:gems] * 100.0).to_f.round(2)}% use Thread constructs explicitly."
+end
+
+private
+
+def defer(*args, parent: Async::Task.current, &block)
+	parent.async do
+		notification = Async::IO::Notification.new
+		
+		thread = Thread.new(*args) do
+			yield
+		ensure
+			notification.signal
+		end
+		
+		notification.wait
+		thread.join
+	ensure
+		notification.close
+	end
 end

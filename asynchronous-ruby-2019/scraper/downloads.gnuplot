@@ -1,8 +1,8 @@
 
 set datafile separator ","
 
-# set terminal svg size 1000, 600 enhanced
-set terminal qt size 1920, 1080
+set terminal svg size 1000, 600 enhanced
+# set terminal qt size 1920, 1080
 
 set xlabel "Gems"
 set xrange [0:*]
