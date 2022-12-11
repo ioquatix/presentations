@@ -10,6 +10,9 @@ require 'async/barrier'
 
 require 'async/io/notification'
 
+require 'periodical/filter'
+require 'csv'
+
 def initialize(context)
 	super
 	
@@ -41,7 +44,7 @@ def count
 	puts "Found #{viable} viable lib paths..."
 end
 
-def statistics
+def downloads
 	top_downloads = @database.from(:gem_downloads).sum(:count)
 	top_total = @gems.sum(:total)
 	total = @database.from(:rubygems).count
@@ -64,33 +67,74 @@ def statistics
 	system("gnuplot downloads.gnuplot > downloads.svg")
 end
 
-def list
+def released
+	versions = @database.from(:versions)
+	filter = Periodical::Filter::Monthly.new(0)
+	
+	measure = Console.logger.measure("Versions", versions.count)
+	
+	histogram = Hash.new{0}
+	
+	versions.each do |version|
+		histogram[filter.key(version[:created_at])] += 1
+		measure.increment
+	end
+	
+	csv = CSV.new($stdout)
+	csv << ['date', 'count']
+	histogram.sort.each do |row|
+		csv << row
+	end
+end
+
+ENSURE = /(.*ensure(.*\n){0,4}.*\$!.*)/
+EX = /\$\!/
+
+def analyze
+	suspects = []
+	count = 0
+	
 	installed_gems = Dir.glob(@pattern).map{|path| [File.basename(path).rpartition('-').first, path]}.to_h
 	
-	@gems.limit(1000).each do |gem|
-		sum = Hash.new{|h,k| h[k] = 0}
+	@gems.limit(10000).each do |gem|
+		matches = []
 		
 		root = installed_gems[gem[:name]]
 		source_files = File.expand_path("lib/**/*.rb", root)
 		
 		Dir.glob(source_files) do |path|
+			matched = false
 			begin
 				code = File.read(path)
 				
-				# code.scan(/Thread|Mutex|\.synchronize/) do |match|
-				code.scan(/\|\|= Mutex/) do |match|
-					sum[match.to_s] += 1
+				code.scan(ENSURE) do |match|
+					matches << [path, match]
+					matched = true
+					count += 1
 				end
-			rescue
-				Async.logger.error(path, $!)
+			rescue ArgumentError
+				# Ignore.
+			rescue => error
+				Async.logger.error(path, error)
 			end
 		end
 		
-		unless sum.empty?
+		unless matches.empty?
 			puts "Gem: #{gem[:name]} has #{gem[:total].to_i} downloads."
-			puts "\t#{root} #{sum}"
+			root = installed_gems[gem[:name]]
+			
+			matches.each do |(path, match)|
+				puts path.gsub(root, '')
+				puts nil, "#{match[0]}", nil
+			end
+			
+			suspects << gem[:name]
 		end
 	end
+	
+	puts "Found #{suspects.size} gems with potential issues."
+	puts "Found #{count} instances of the pattern."
+	puts suspects.inspect
 end
 
 def fetch
@@ -98,7 +142,9 @@ def fetch
 	
 	puts "#{installed_gems.size} installed gems."
 	
-	puts "Considering #{gems.count} gems..."
+	puts "Considering #{@gems.count} gems..."
+	
+	progress = Console.logger.progress(@gems.count)
 	
 	skipped = 0
 	
@@ -125,7 +171,7 @@ def fetch
 			Async.logger.info "Fetching #{gem[:name]} which has #{gem[:total].to_i} downloads..."
 			
 			defer(parent: barrier) do
-				sh("gem", "unpack", gem[:name], chdir: cache_path)
+				system("gem", "unpack", gem[:name], chdir: cache_path)
 			end
 		end
 		
@@ -148,7 +194,7 @@ def check
 	sums = {}
 	
 	@gems.each do |gem|
-		puts "Considering #{gem[:name]} #{gem[:total].to_i} downloads..."
+		# puts "Considering #{gem[:name]} #{gem[:total].to_i} downloads..."
 		root = installed_gems[gem[:name]]
 		
 		count[:gems] += 1
@@ -157,11 +203,13 @@ def check
 		source_files = File.expand_path("**/*.rb", root)
 		
 		Dir.glob(source_files) do |path|
+			next unless File.readable?(path)
+			
 			begin
 				code = File.read(path)
 				found = Hash.new{|h,k| h[k] = 0}
 				
-				code.scan(/Mutex|Monitor/) do |match|
+				code.scan(/read_nonblock.*/) do |match|
 					sum[match.to_s] += 1
 					found[match.to_s] += 1
 				end
@@ -179,7 +227,7 @@ def check
 		end
 	end
 	
-	puts "Out of #{count[:gems]}, #{(sums.size.to_f / count[:gems] * 100.0).to_f.round(2)}% use Thread constructs explicitly."
+	puts "Out of #{count[:gems]}, #{(sums.size.to_f / count[:gems] * 100.0).to_f.round(2)}% matched."
 end
 
 private
